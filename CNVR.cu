@@ -1,0 +1,1466 @@
+#include "CNVR.h"
+
+#define mul4(v,k) { \
+    v->x = v->x * k; \
+    v->y = v->y * k; \
+    v->z = v->z * k;\
+}
+
+#define vecdiv4(v,k) { \
+    v->x = v->x / k; \
+    v->y = v->y / k; \
+    v->z = v->z / k;\
+}
+
+__device__  void sort_small(float *d, const int n)
+{
+    int j;
+    for (int i = 1; i < n; i++) {
+        float tmp = d[i];
+        for (j = i; j >= 1 && tmp < d[j-1]; j--)
+            d[j] = d[j-1];
+        d[j] = tmp;
+    }
+}
+
+__device__ void sort_small_weighted(float *d, float *w, int n)
+{
+    int j;
+    for (int i = 1; i < n; i++) {
+        float tmp = d[i];
+        float tmp_w = w[i];
+        for (j = i; j >= 1 && tmp < d[j - 1]; j--) {
+            d[j] = d[j - 1];
+            w[j] = w[j - 1];
+        }
+        d[j] = tmp;
+        w[j] = tmp_w;
+    }
+}
+
+__device__ int FindMinCostIndex(const float *costs, const int n)
+{
+    float min_cost = costs[0];
+    int min_cost_idx = 0;
+    for (int idx = 1; idx < n; ++idx) {
+        if (costs[idx] <= min_cost) {
+            min_cost = costs[idx];
+            min_cost_idx = idx;
+        }
+    }
+    return min_cost_idx;
+}
+
+__device__  void setBit(unsigned int &input, const unsigned int n)
+{
+    input |= (unsigned int)(1 << n);
+}
+
+__device__  int isSet(unsigned int input, const unsigned int n)
+{
+    return (input >> n) & 1;
+}
+
+__device__ void Mat33DotVec3(const float mat[9], const float4 vec, float4 *result)
+{
+  result->x = mat[0] * vec.x + mat[1] * vec.y + mat[2] * vec.z;
+  result->y = mat[3] * vec.x + mat[4] * vec.y + mat[5] * vec.z;
+  result->z = mat[6] * vec.x + mat[7] * vec.y + mat[8] * vec.z;
+}
+
+__device__ float Vec3DotVec3(const float4 vec1, const float4 vec2)
+{
+    return vec1.x * vec2.x + vec1.y * vec2.y + vec1.z * vec2.z;
+}
+
+__device__ void NormalizeVec3 (float4 *vec)
+{
+    const float normSquared = vec->x * vec->x + vec->y * vec->y + vec->z * vec->z;
+    const float inverse_sqrt = rsqrtf (normSquared);
+    vec->x *= inverse_sqrt;
+    vec->y *= inverse_sqrt;
+    vec->z *= inverse_sqrt;
+}
+
+__device__ void TransformPDFToCDF(float* probs, const int num_probs)
+{
+    float prob_sum = 0.0f;
+    for (int i = 0; i < num_probs; ++i) {
+        prob_sum += probs[i];
+    }
+    const float inv_prob_sum = 1.0f / prob_sum;
+
+    float cum_prob = 0.0f;
+    for (int i = 0; i < num_probs; ++i) {
+        const float prob = probs[i] * inv_prob_sum;
+        cum_prob += prob;
+        probs[i] = cum_prob;
+    }
+}
+
+__device__ void Get3DPoint(const Camera camera, const int2 p, const float depth, float *X)
+{
+    X[0] = depth * (p.x - camera.K[2]) / camera.K[0];
+    X[1] = depth * (p.y - camera.K[5]) / camera.K[4];
+    X[2] = depth;
+}
+
+__device__ void Get3DPointfloat(const Camera camera, const float2 p, const float depth, float* X)
+{
+    X[0] = depth * (p.x - camera.K[2]) / camera.K[0];
+    X[1] = depth * (p.y - camera.K[5]) / camera.K[4];
+    X[2] = depth;
+}
+
+__device__ float4 GetViewDirection(const Camera camera, const int2 p, const float depth)
+{
+    float X[3];
+    Get3DPoint(camera, p, depth, X);
+    float norm = sqrt(X[0] * X[0] + X[1] * X[1] + X[2] * X[2]);
+
+    float4 view_direction;
+    view_direction.x = X[0] / norm;
+    view_direction.y = X[1] / norm;
+    view_direction.z =  X[2] / norm;
+    view_direction.w = 0;
+    return view_direction;
+}
+
+__device__ float4 GetViewDirectionfloat(const Camera camera, const float2 p, const float depth)
+{
+    float X[3];
+    Get3DPointfloat(camera, p, depth, X);
+    float norm = sqrt(X[0] * X[0] + X[1] * X[1] + X[2] * X[2]);
+
+    float4 view_direction;
+    view_direction.x = X[0] / norm;
+    view_direction.y = X[1] / norm;
+    view_direction.z = X[2] / norm;
+    view_direction.w = 0;
+    return view_direction;
+}
+
+__device__ float GetDistance2Origin(const Camera camera, const int2 p, const float depth, const float4 normal)
+{
+    float X[3];
+    Get3DPoint(camera, p, depth, X);
+    return -(normal.x * X[0] + normal.y * X[1] + normal.z * X[2]);
+}
+
+__device__   float SpatialGauss(float x1, float y1, float x2, float y2, float sigma, float mu = 0.0)
+{
+    float dis = pow(x1 - x2, 2) + pow(y1 - y2, 2) - mu;
+    return exp(-1.0 * dis / (2 * sigma * sigma));
+}
+
+__device__  float RangeGauss(float x, float sigma, float mu = 0.0)
+{
+    float x_p = x - mu;
+    return exp(-1.0 * (x_p * x_p) / (2 * sigma * sigma));
+}
+
+__device__ float ComputeDepthfromPlaneHypothesis(const Camera camera, const float4 plane_hypothesis, const int2 p)
+{
+    return -plane_hypothesis.w * camera.K[0] / ((p.x - camera.K[2]) * plane_hypothesis.x + (camera.K[0] / camera.K[4]) * (p.y - camera.K[5]) * plane_hypothesis.y + camera.K[0] * plane_hypothesis.z);
+}
+
+__device__ float4 GenerateRandomNormal(const Camera camera, const int2 p, curandState *rand_state, const float depth)
+{
+    float4 normal;
+    float q1 = 1.0f;
+    float q2 = 1.0f;
+    float s = 2.0f;
+    while (s >= 1.0f) {
+        q1 = 2.0f * curand_uniform(rand_state) -1.0f;
+        q2 = 2.0f * curand_uniform(rand_state) - 1.0f;
+        s = q1 * q1 + q2 * q2;
+    }
+    const float sq = sqrt(1.0f - s);
+    normal.x = 2.0f * q1 * sq;
+    normal.y = 2.0f * q2 * sq;
+    normal.z = 1.0f - 2.0f * s;
+    normal.w = 0;
+
+    float4 view_direction = GetViewDirection(camera, p, depth);
+    float dot_product = normal.x * view_direction.x + normal.y * view_direction.y + normal.z * view_direction.z;
+    if (dot_product > 0.0f) {
+        normal.x = -normal.x;
+        normal.y = -normal.y;
+        normal.z = - normal.z;
+    }
+    NormalizeVec3(&normal);
+    return normal;
+}
+
+__device__ float4 GenerateSphereNormal(const Camera camera, const int2 p, curandState* rand_state, const float depth)
+{
+    float4 normal;
+    float4 view_direction = GetViewDirection(camera, p, depth);
+    normal.x = -view_direction.x;
+    normal.y = -view_direction.y;
+    normal.z = -view_direction.z;
+    NormalizeVec3(&normal);
+    return normal;
+}
+
+__device__ float4 GeneratePerturbedNormal(const Camera camera, const int2 p, const float4 normal, curandState *rand_state, const float perturbation)
+{
+    float4 view_direction = GetViewDirection(camera, p, 1.0f);
+
+    const float a1 = (curand_uniform(rand_state) - 0.5f) * perturbation;
+    const float a2 = (curand_uniform(rand_state) - 0.5f) * perturbation;
+    const float a3 = (curand_uniform(rand_state) - 0.5f) * perturbation;
+
+    const float sin_a1 = sin(a1);
+    const float sin_a2 = sin(a2);
+    const float sin_a3 = sin(a3);
+    const float cos_a1 = cos(a1);
+    const float cos_a2 = cos(a2);
+    const float cos_a3 = cos(a3);
+
+    float R[9];
+    R[0] = cos_a2 * cos_a3;
+    R[1] = cos_a3 * sin_a1 * sin_a2 - cos_a1 * sin_a3;
+    R[2] = sin_a1 * sin_a3 + cos_a1 * cos_a3 * sin_a2;
+    R[3] = cos_a2 * sin_a3;
+    R[4] = cos_a1 * cos_a3 + sin_a1 * sin_a2 * sin_a3;
+    R[5] = cos_a1 * sin_a2 * sin_a3 - cos_a3 * sin_a1;
+    R[6] = -sin_a2;
+    R[7] = cos_a2 * sin_a1;
+    R[8] = cos_a1 * cos_a2;
+
+    float4 normal_perturbed;
+    Mat33DotVec3(R, normal, &normal_perturbed);
+
+    if (Vec3DotVec3(normal_perturbed, view_direction) >= 0.0f) {
+        normal_perturbed = normal;
+    }
+
+    NormalizeVec3(&normal_perturbed);
+    return normal_perturbed;
+}
+
+__device__ float4 GenerateRandomPlaneHypothesis(const Camera camera, const int2 p, curandState *rand_state, const float depth_min, const float depth_max)
+{
+    float depth = curand_uniform(rand_state) * (depth_max - depth_min) + depth_min;
+    float4 plane_hypothesis = GenerateSphereNormal(camera, p, rand_state, depth);
+    plane_hypothesis.w = GetDistance2Origin(camera, p, depth, plane_hypothesis);
+    return plane_hypothesis;
+}
+
+__device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int2 p, curandState *rand_state, const float perturbation, const float4 plane_hypothesis_now, const float depth_now, const float depth_min, const float depth_max)
+{
+    float depth_perturbed = depth_now;
+
+    float dist_perturbed = plane_hypothesis_now.w;
+    const float dist_min_perturbed = (1 - perturbation) * dist_perturbed;
+    const float dist_max_perturbed = (1 + perturbation) * dist_perturbed;
+    float4 plane_hypothesis_temp = plane_hypothesis_now;
+    do {
+        dist_perturbed = curand_uniform(rand_state) * (dist_max_perturbed - dist_min_perturbed) + dist_min_perturbed;
+        plane_hypothesis_temp.w = dist_perturbed;
+        depth_perturbed = ComputeDepthfromPlaneHypothesis(camera, plane_hypothesis_temp, p);
+    } while (depth_perturbed < depth_min && depth_perturbed > depth_max);
+
+    float4 plane_hypothesis = GeneratePerturbedNormal(camera, p, plane_hypothesis_now, rand_state, perturbation * M_PI);
+    plane_hypothesis.w = dist_perturbed;
+    return plane_hypothesis;
+}
+
+__device__ void ComputeHomography(const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, float *H)
+{
+    float ref_C[3];
+    float src_C[3];
+    ref_C[0] = -(ref_camera.R[0] * ref_camera.t[0] + ref_camera.R[3] * ref_camera.t[1] + ref_camera.R[6] * ref_camera.t[2]);
+    ref_C[1] = -(ref_camera.R[1] * ref_camera.t[0] + ref_camera.R[4] * ref_camera.t[1] + ref_camera.R[7] * ref_camera.t[2]);
+    ref_C[2] = -(ref_camera.R[2] * ref_camera.t[0] + ref_camera.R[5] * ref_camera.t[1] + ref_camera.R[8] * ref_camera.t[2]);
+    src_C[0] = -(src_camera.R[0] * src_camera.t[0] + src_camera.R[3] * src_camera.t[1] + src_camera.R[6] * src_camera.t[2]);
+    src_C[1] = -(src_camera.R[1] * src_camera.t[0] + src_camera.R[4] * src_camera.t[1] + src_camera.R[7] * src_camera.t[2]);
+    src_C[2] = -(src_camera.R[2] * src_camera.t[0] + src_camera.R[5] * src_camera.t[1] + src_camera.R[8] * src_camera.t[2]);
+
+    float R_relative[9];
+    float C_relative[3];
+    float t_relative[3];
+    R_relative[0] = src_camera.R[0] * ref_camera.R[0] + src_camera.R[1] * ref_camera.R[1] + src_camera.R[2] *ref_camera.R[2];
+    R_relative[1] = src_camera.R[0] * ref_camera.R[3] + src_camera.R[1] * ref_camera.R[4] + src_camera.R[2] *ref_camera.R[5];
+    R_relative[2] = src_camera.R[0] * ref_camera.R[6] + src_camera.R[1] * ref_camera.R[7] + src_camera.R[2] *ref_camera.R[8];
+    R_relative[3] = src_camera.R[3] * ref_camera.R[0] + src_camera.R[4] * ref_camera.R[1] + src_camera.R[5] *ref_camera.R[2];
+    R_relative[4] = src_camera.R[3] * ref_camera.R[3] + src_camera.R[4] * ref_camera.R[4] + src_camera.R[5] *ref_camera.R[5];
+    R_relative[5] = src_camera.R[3] * ref_camera.R[6] + src_camera.R[4] * ref_camera.R[7] + src_camera.R[5] *ref_camera.R[8];
+    R_relative[6] = src_camera.R[6] * ref_camera.R[0] + src_camera.R[7] * ref_camera.R[1] + src_camera.R[8] *ref_camera.R[2];
+    R_relative[7] = src_camera.R[6] * ref_camera.R[3] + src_camera.R[7] * ref_camera.R[4] + src_camera.R[8] *ref_camera.R[5];
+    R_relative[8] = src_camera.R[6] * ref_camera.R[6] + src_camera.R[7] * ref_camera.R[7] + src_camera.R[8] *ref_camera.R[8];
+    C_relative[0] = (ref_C[0] - src_C[0]);
+    C_relative[1] = (ref_C[1] - src_C[1]);
+    C_relative[2] = (ref_C[2] - src_C[2]);
+    t_relative[0] = src_camera.R[0] * C_relative[0] + src_camera.R[1] * C_relative[1] + src_camera.R[2] * C_relative[2];
+    t_relative[1] = src_camera.R[3] * C_relative[0] + src_camera.R[4] * C_relative[1] + src_camera.R[5] * C_relative[2];
+    t_relative[2] = src_camera.R[6] * C_relative[0] + src_camera.R[7] * C_relative[1] + src_camera.R[8] * C_relative[2];
+
+    H[0] = R_relative[0] - t_relative[0] * plane_hypothesis.x / plane_hypothesis.w;
+    H[1] = R_relative[1] - t_relative[0] * plane_hypothesis.y / plane_hypothesis.w;
+    H[2] = R_relative[2] - t_relative[0] * plane_hypothesis.z / plane_hypothesis.w;
+    H[3] = R_relative[3] - t_relative[1] * plane_hypothesis.x / plane_hypothesis.w;
+    H[4] = R_relative[4] - t_relative[1] * plane_hypothesis.y / plane_hypothesis.w;
+    H[5] = R_relative[5] - t_relative[1] * plane_hypothesis.z / plane_hypothesis.w;
+    H[6] = R_relative[6] - t_relative[2] * plane_hypothesis.x / plane_hypothesis.w;
+    H[7] = R_relative[7] - t_relative[2] * plane_hypothesis.y / plane_hypothesis.w;
+    H[8] = R_relative[8] - t_relative[2] * plane_hypothesis.z / plane_hypothesis.w;
+
+    float tmp[9];
+    tmp[0] = H[0] / ref_camera.K[0];
+    tmp[1] = H[1] / ref_camera.K[4];
+    tmp[2] = -H[0] * ref_camera.K[2] / ref_camera.K[0] - H[1] * ref_camera.K[5] / ref_camera.K[4] + H[2];
+    tmp[3] = H[3] / ref_camera.K[0];
+    tmp[4] = H[4] / ref_camera.K[4];
+    tmp[5] = -H[3] * ref_camera.K[2] / ref_camera.K[0] - H[4] * ref_camera.K[5] / ref_camera.K[4] + H[5];
+    tmp[6] = H[6] / ref_camera.K[0];
+    tmp[7] = H[7] / ref_camera.K[4];
+    tmp[8] = -H[6] * ref_camera.K[2] / ref_camera.K[0] - H[7] * ref_camera.K[5] / ref_camera.K[4] + H[8];
+
+    H[0] = src_camera.K[0] * tmp[0] + src_camera.K[2] * tmp[6];
+    H[1] = src_camera.K[0] * tmp[1] + src_camera.K[2] * tmp[7];
+    H[2] = src_camera.K[0] * tmp[2] + src_camera.K[2] * tmp[8];
+    H[3] = src_camera.K[4] * tmp[3] + src_camera.K[5] * tmp[6];
+    H[4] = src_camera.K[4] * tmp[4] + src_camera.K[5] * tmp[7];
+    H[5] = src_camera.K[4] * tmp[5] + src_camera.K[5] * tmp[8];
+    H[6] = src_camera.K[8] * tmp[6];
+    H[7] = src_camera.K[8] * tmp[7];
+    H[8] = src_camera.K[8] * tmp[8];
+}
+
+__device__ void ComputeHomography2(const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, float* H , float4 & plane_hypothesis_src)
+{
+    float ref_C[3];
+    float src_C[3];
+    ref_C[0] = -(ref_camera.R[0] * ref_camera.t[0] + ref_camera.R[3] * ref_camera.t[1] + ref_camera.R[6] * ref_camera.t[2]);
+    ref_C[1] = -(ref_camera.R[1] * ref_camera.t[0] + ref_camera.R[4] * ref_camera.t[1] + ref_camera.R[7] * ref_camera.t[2]);
+    ref_C[2] = -(ref_camera.R[2] * ref_camera.t[0] + ref_camera.R[5] * ref_camera.t[1] + ref_camera.R[8] * ref_camera.t[2]);
+    src_C[0] = -(src_camera.R[0] * src_camera.t[0] + src_camera.R[3] * src_camera.t[1] + src_camera.R[6] * src_camera.t[2]);
+    src_C[1] = -(src_camera.R[1] * src_camera.t[0] + src_camera.R[4] * src_camera.t[1] + src_camera.R[7] * src_camera.t[2]);
+    src_C[2] = -(src_camera.R[2] * src_camera.t[0] + src_camera.R[5] * src_camera.t[1] + src_camera.R[8] * src_camera.t[2]);
+
+    float R_relative[9];
+    float C_relative[3];
+    float t_relative[3];
+    R_relative[0] = src_camera.R[0] * ref_camera.R[0] + src_camera.R[1] * ref_camera.R[1] + src_camera.R[2] * ref_camera.R[2];
+    R_relative[1] = src_camera.R[0] * ref_camera.R[3] + src_camera.R[1] * ref_camera.R[4] + src_camera.R[2] * ref_camera.R[5];
+    R_relative[2] = src_camera.R[0] * ref_camera.R[6] + src_camera.R[1] * ref_camera.R[7] + src_camera.R[2] * ref_camera.R[8];
+    R_relative[3] = src_camera.R[3] * ref_camera.R[0] + src_camera.R[4] * ref_camera.R[1] + src_camera.R[5] * ref_camera.R[2];
+    R_relative[4] = src_camera.R[3] * ref_camera.R[3] + src_camera.R[4] * ref_camera.R[4] + src_camera.R[5] * ref_camera.R[5];
+    R_relative[5] = src_camera.R[3] * ref_camera.R[6] + src_camera.R[4] * ref_camera.R[7] + src_camera.R[5] * ref_camera.R[8];
+    R_relative[6] = src_camera.R[6] * ref_camera.R[0] + src_camera.R[7] * ref_camera.R[1] + src_camera.R[8] * ref_camera.R[2];
+    R_relative[7] = src_camera.R[6] * ref_camera.R[3] + src_camera.R[7] * ref_camera.R[4] + src_camera.R[8] * ref_camera.R[5];
+    R_relative[8] = src_camera.R[6] * ref_camera.R[6] + src_camera.R[7] * ref_camera.R[7] + src_camera.R[8] * ref_camera.R[8];
+    C_relative[0] = (ref_C[0] - src_C[0]);
+    C_relative[1] = (ref_C[1] - src_C[1]);
+    C_relative[2] = (ref_C[2] - src_C[2]);
+    t_relative[0] = src_camera.R[0] * C_relative[0] + src_camera.R[1] * C_relative[1] + src_camera.R[2] * C_relative[2];
+    t_relative[1] = src_camera.R[3] * C_relative[0] + src_camera.R[4] * C_relative[1] + src_camera.R[5] * C_relative[2];
+    t_relative[2] = src_camera.R[6] * C_relative[0] + src_camera.R[7] * C_relative[1] + src_camera.R[8] * C_relative[2];
+
+    H[0] = R_relative[0] - t_relative[0] * plane_hypothesis.x / plane_hypothesis.w;
+    H[1] = R_relative[1] - t_relative[0] * plane_hypothesis.y / plane_hypothesis.w;
+    H[2] = R_relative[2] - t_relative[0] * plane_hypothesis.z / plane_hypothesis.w;
+    H[3] = R_relative[3] - t_relative[1] * plane_hypothesis.x / plane_hypothesis.w;
+    H[4] = R_relative[4] - t_relative[1] * plane_hypothesis.y / plane_hypothesis.w;
+    H[5] = R_relative[5] - t_relative[1] * plane_hypothesis.z / plane_hypothesis.w;
+    H[6] = R_relative[6] - t_relative[2] * plane_hypothesis.x / plane_hypothesis.w;
+    H[7] = R_relative[7] - t_relative[2] * plane_hypothesis.y / plane_hypothesis.w;
+    H[8] = R_relative[8] - t_relative[2] * plane_hypothesis.z / plane_hypothesis.w;
+
+    float tmp[9];
+    tmp[0] = H[0] / ref_camera.K[0];
+    tmp[1] = H[1] / ref_camera.K[4];
+    tmp[2] = -H[0] * ref_camera.K[2] / ref_camera.K[0] - H[1] * ref_camera.K[5] / ref_camera.K[4] + H[2];
+    tmp[3] = H[3] / ref_camera.K[0];
+    tmp[4] = H[4] / ref_camera.K[4];
+    tmp[5] = -H[3] * ref_camera.K[2] / ref_camera.K[0] - H[4] * ref_camera.K[5] / ref_camera.K[4] + H[5];
+    tmp[6] = H[6] / ref_camera.K[0];
+    tmp[7] = H[7] / ref_camera.K[4];
+    tmp[8] = -H[6] * ref_camera.K[2] / ref_camera.K[0] - H[7] * ref_camera.K[5] / ref_camera.K[4] + H[8];
+
+    H[0] = src_camera.K[0] * tmp[0] + src_camera.K[2] * tmp[6];
+    H[1] = src_camera.K[0] * tmp[1] + src_camera.K[2] * tmp[7];
+    H[2] = src_camera.K[0] * tmp[2] + src_camera.K[2] * tmp[8];
+    H[3] = src_camera.K[4] * tmp[3] + src_camera.K[5] * tmp[6];
+    H[4] = src_camera.K[4] * tmp[4] + src_camera.K[5] * tmp[7];
+    H[5] = src_camera.K[4] * tmp[5] + src_camera.K[5] * tmp[8];
+    H[6] = src_camera.K[8] * tmp[6];
+    H[7] = src_camera.K[8] * tmp[7];
+    H[8] = src_camera.K[8] * tmp[8];
+
+    plane_hypothesis_src.x = R_relative[0] * plane_hypothesis.x + R_relative[1] * plane_hypothesis.y + R_relative[2] * plane_hypothesis.z;
+    plane_hypothesis_src.y = R_relative[3] * plane_hypothesis.x + R_relative[4] * plane_hypothesis.y + R_relative[5] * plane_hypothesis.z;
+    plane_hypothesis_src.z = R_relative[6] * plane_hypothesis.x + R_relative[7] * plane_hypothesis.y + R_relative[8] * plane_hypothesis.z;
+}
+
+__device__ float2 ComputeCorrespondingPoint(const float *H, const int2 p)
+{
+    float3 pt;
+    pt.x = H[0] * p.x + H[1] * p.y + H[2];
+    pt.y = H[3] * p.x + H[4] * p.y + H[5];
+    pt.z = H[6] * p.x + H[7] * p.y + H[8];
+    return make_float2(pt.x / abs(pt.z), pt.y / abs(pt.z));
+}
+
+__device__ float3 ComputeCorrespondingPoint3(const float* H, const int2 p)
+{
+    float3 pt;
+    pt.x = H[0] * p.x + H[1] * p.y + H[2];
+    pt.y = H[3] * p.x + H[4] * p.y + H[5];
+    pt.z = H[6] * p.x + H[7] * p.y + H[8];
+    return make_float3(pt.x / pt.z, pt.y / pt.z, pt.z);
+}
+
+__device__ float4 TransformNormal(const Camera camera, float4 plane_hypothesis)
+{
+    float4 transformed_normal;
+    transformed_normal.x = camera.R[0] * plane_hypothesis.x + camera.R[3] * plane_hypothesis.y + camera.R[6] * plane_hypothesis.z;
+    transformed_normal.y = camera.R[1] * plane_hypothesis.x + camera.R[4] * plane_hypothesis.y + camera.R[7] * plane_hypothesis.z;
+    transformed_normal.z = camera.R[2] * plane_hypothesis.x + camera.R[5] * plane_hypothesis.y + camera.R[8] * plane_hypothesis.z;
+    transformed_normal.w = plane_hypothesis.w;
+    return transformed_normal;
+}
+
+__device__ float4 TransformNormal2RefCam(const Camera camera, float4 plane_hypothesis)
+{
+    float4 transformed_normal;
+    transformed_normal.x = camera.R[0] * plane_hypothesis.x + camera.R[1] * plane_hypothesis.y + camera.R[2] * plane_hypothesis.z;
+    transformed_normal.y = camera.R[3] * plane_hypothesis.x + camera.R[4] * plane_hypothesis.y + camera.R[5] * plane_hypothesis.z;
+    transformed_normal.z = camera.R[6] * plane_hypothesis.x + camera.R[7] * plane_hypothesis.y + camera.R[8] * plane_hypothesis.z;
+    transformed_normal.w = plane_hypothesis.w;
+    return transformed_normal;
+}
+
+__device__ float ComputeBilateralWeight(const float x_dist, const float y_dist, const float pix, const float center_pix, const float sigma_spatial, const float sigma_color)
+{
+    const float spatial_dist = sqrt(x_dist * x_dist + y_dist * y_dist);
+    const float color_dist = fabs(pix - center_pix);
+    return exp(-spatial_dist / (2.0f * sigma_spatial* sigma_spatial) - color_dist / (2.0f * sigma_color * sigma_color));
+}
+
+__device__ float ComputeBilateralWeightInverse(const float x_dist, const float y_dist, const float pix, const float center_pix, const float sigma_spatial, const float sigma_color)
+{
+    const float spatial_dist = sqrt(x_dist * x_dist + y_dist * y_dist);
+    const float color_dist = fabs(pix - center_pix);
+    return exp(spatial_dist / (2.0f * sigma_spatial * sigma_spatial) + color_dist / (2.0f * sigma_color * sigma_color));
+}
+
+
+// CNCC  and viewing ray restriction
+__device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image, const Camera ref_camera, const cudaTextureObject_t src_image, const Camera src_camera, const int2 p, const float4 plane_hypothesis, const PatchMatchParams params)
+{
+    const float cost_max = 2.0f;
+    int radius = params.patch_size / 2;
+
+    float H[9];
+    float4 plane_hypothesis_src;
+
+    ComputeHomography2(ref_camera, src_camera, plane_hypothesis, H, plane_hypothesis_src);
+    
+    float3 ptz = ComputeCorrespondingPoint3(H, p);
+    float2 pt = make_float2(ptz.x, ptz.y);
+
+    // make sure that depth > 0
+    if (ptz.z < 0) {
+        return cost_max;
+    }
+
+    if (pt.x >= src_camera.width || pt.x < 0.0f || pt.y >= src_camera.height || pt.y < 0.0f) {
+        return cost_max;
+    }
+    
+    float4 view_direction = GetViewDirectionfloat(src_camera, pt, 1.0f);
+    
+    // if the view_direction conflicts viewray restriction, then the matching cost is set to cost_max
+    if (Vec3DotVec3(plane_hypothesis_src, view_direction) >= 0.0f) {
+        return cost_max;
+    }
+    float cost = 0.0f;
+    {
+        float sum_ref = 0.0f;
+        float sum_ref_ref = 0.0f;
+        float sum_src = 0.0f;
+        float sum_src_src = 0.0f;
+        float sum_ref_src = 0.0f;
+        float bilateral_weight_sum = 0.0f;
+        const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
+        const float src_center_pix = tex2D<float>(src_image, pt.x + 0.5f, pt.y + 0.5f);
+
+        for (int i = -radius; i < radius + 1; i += params.radius_increment) {
+            float sum_ref_row = 0.0f;
+            float sum_src_row = 0.0f;
+            float sum_ref_ref_row = 0.0f;
+            float sum_src_src_row = 0.0f;
+            float sum_ref_src_row = 0.0f;
+            float bilateral_weight_sum_row = 0.0f;
+
+            for (int j = -radius; j < radius + 1; j += params.radius_increment) {
+                const int2 ref_pt = make_int2(p.x + i, p.y + j);
+                const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
+                float2 src_pt = ComputeCorrespondingPoint(H, ref_pt);
+                const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+                float weight(1);
+                if (params.repair == false) {
+                    weight = ComputeBilateralWeight(i, j, ref_pix, ref_center_pix, params.sigma_spatial, params.sigma_color);
+                }
+                sum_ref_row += weight * ref_pix;
+                sum_ref_ref_row += weight * ref_pix * ref_pix;
+                sum_src_row += weight * src_pix;
+                sum_src_src_row += weight * src_pix * src_pix;
+                sum_ref_src_row += weight * ref_pix * src_pix;
+                bilateral_weight_sum_row += weight;
+            }
+
+            sum_ref += sum_ref_row;
+            sum_ref_ref += sum_ref_ref_row;
+            sum_src += sum_src_row;
+            sum_src_src += sum_src_src_row;
+            sum_ref_src += sum_ref_src_row;
+            bilateral_weight_sum += bilateral_weight_sum_row;
+        }
+        const float inv_bilateral_weight_sum = 1.0f / bilateral_weight_sum;
+        sum_ref *= inv_bilateral_weight_sum;
+        sum_ref_ref *= inv_bilateral_weight_sum;
+        sum_src *= inv_bilateral_weight_sum;
+        sum_src_src *= inv_bilateral_weight_sum;
+        sum_ref_src *= inv_bilateral_weight_sum;
+
+        const float var_ref = sum_ref_ref - sum_ref * sum_ref;
+        const float var_src = sum_src_src - sum_src * sum_src;
+        const float kMinVar = 1e-3f;
+        if (var_ref < kMinVar || var_src < kMinVar) {
+            return cost = cost_max;
+        }
+        else {
+            if (params.repair) {
+                // CNCC
+                const float var_ref_center = sum_ref_ref - 2 * ref_center_pix * sum_ref + ref_center_pix * ref_center_pix;
+                const float var_src_center = sum_src_src - 2 * src_center_pix * sum_src + src_center_pix * src_center_pix;
+                const float covar_src_ref_center = sum_ref_src - src_center_pix * sum_ref - ref_center_pix * sum_src + ref_center_pix * src_center_pix;
+                const float var_ref_src_center = sqrt(var_ref_center * var_src_center);
+                return cost = max(0.0f, min(cost_max, 1.0f - covar_src_ref_center / var_ref_src_center));
+            }
+            else {
+                // NCC
+                const float covar_src_ref = sum_ref_src - sum_ref * sum_src;
+                const float var_ref_src = sqrt(var_ref * var_src);
+                return cost = max(0.0f, min(cost_max, 1.0f - covar_src_ref / var_ref_src));
+            }
+            
+        }
+    }
+}
+
+
+__device__ float ComputeColorWeight(const float pix, const float center_pix, const float sigma_color)
+{
+    //const float spatial_dist = sqrt(x_dist * x_dist + y_dist * y_dist);
+    const float color_dist = fabs(pix - center_pix);
+    return exp(- color_dist / (2.0f * sigma_color * sigma_color));
+}
+
+
+__device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
+{
+    float cost_max = 2.0f;
+    float cost_vector[32] = {2.0f};
+    float cost_vector_copy[32] = {2.0f};
+    int cost_count = 0;
+    int num_valid_views = 0;
+
+    for (int i = 1; i < params.num_images; ++i) {
+        float c = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+        cost_vector[i - 1] = c;
+        cost_vector_copy[i - 1] = c;
+        cost_count++;
+        if (c < cost_max) {
+            num_valid_views++;
+        }
+    }
+
+    sort_small(cost_vector, cost_count);
+    *selected_views = 0;
+
+    int top_k = min(num_valid_views, params.top_k);
+    if (top_k > 0) {
+        float cost = 0.0f;
+        for (int i = 0; i < top_k; ++i) {
+            cost += cost_vector[i];
+        }
+        float cost_threshold = cost_vector[top_k - 1];
+        for (int i = 0; i < params.num_images - 1; ++i) {
+
+            if (cost_vector_copy[i] <= cost_threshold) {
+                setBit(*selected_views, i);
+            }
+        }
+        return cost / top_k;
+    } else {
+        return cost_max;
+    }
+}
+
+__device__ void ComputeMultiViewCostVector(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, float *cost_vector, const PatchMatchParams params)
+{
+    for (int i = 1; i < params.num_images; ++i) {
+        cost_vector[i - 1] = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+    }
+}
+
+__device__ float3 Get3DPointonWorld_cu(const float x, const float y, const float depth, const Camera camera)
+{
+    float3 pointX;
+    float3 tmpX;
+
+    // Reprojection
+    pointX.x = depth * (x - camera.K[2]) / camera.K[0];
+    pointX.y = depth * (y - camera.K[5]) / camera.K[4];
+    pointX.z = depth;
+
+    // Rotation
+    tmpX.x = camera.R[0] * pointX.x + camera.R[3] * pointX.y + camera.R[6] * pointX.z;
+    tmpX.y = camera.R[1] * pointX.x + camera.R[4] * pointX.y + camera.R[7] * pointX.z;
+    tmpX.z = camera.R[2] * pointX.x + camera.R[5] * pointX.y + camera.R[8] * pointX.z;
+
+    // Transformation
+    float3 C;
+    C.x = -(camera.R[0] * camera.t[0] + camera.R[3] * camera.t[1] + camera.R[6] * camera.t[2]);
+    C.y = -(camera.R[1] * camera.t[0] + camera.R[4] * camera.t[1] + camera.R[7] * camera.t[2]);
+    C.z = -(camera.R[2] * camera.t[0] + camera.R[5] * camera.t[1] + camera.R[8] * camera.t[2]);
+    pointX.x = tmpX.x + C.x;
+    pointX.y = tmpX.y + C.y;
+    pointX.z = tmpX.z + C.z;
+
+    return pointX;
+}
+
+__device__ void ProjectonCamera_cu(const float3 PointX, const Camera camera, float2 &point, float &depth)
+{
+    float3 tmp;
+    tmp.x = camera.R[0] * PointX.x + camera.R[1] * PointX.y + camera.R[2] * PointX.z + camera.t[0];
+    tmp.y = camera.R[3] * PointX.x + camera.R[4] * PointX.y + camera.R[5] * PointX.z + camera.t[1];
+    tmp.z = camera.R[6] * PointX.x + camera.R[7] * PointX.y + camera.R[8] * PointX.z + camera.t[2];
+
+    depth = camera.K[6] * tmp.x + camera.K[7] * tmp.y + camera.K[8] * tmp.z;
+    point.x = (camera.K[0] * tmp.x + camera.K[1] * tmp.y + camera.K[2] * tmp.z) / depth;
+    point.y = (camera.K[3] * tmp.x + camera.K[4] * tmp.y + camera.K[5] * tmp.z) / depth;
+}
+
+__device__ float ComputeDepthConsistencyCost(const cudaTextureObject_t depth_image, const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, const int2 p)
+{
+    const float max_cost = 3.0f;
+    float depth = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
+    float3 forward_point = Get3DPointonWorld_cu(p.x, p.y, depth, ref_camera);
+
+    float2 src_pt;
+    float src_d;
+    ProjectonCamera_cu(forward_point, src_camera, src_pt, src_d);
+    const float src_depth = tex2D<float>(depth_image, (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
+
+    if (src_depth == 0.0f) {
+        return max_cost;
+    }
+
+    float3 src_3D_pt = Get3DPointonWorld_cu(src_pt.x, src_pt.y, src_depth, src_camera);
+
+    float2 backward_point;
+    float ref_d;
+    ProjectonCamera_cu(src_3D_pt, ref_camera, backward_point, ref_d);
+
+    const float diff_col = p.x - backward_point.x;
+    const float diff_row = p.y - backward_point.y;
+    return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
+}
+
+__device__ float ComputeNormConsistencyCost(const cudaTextureObject_t normal_image0, const cudaTextureObject_t normal_image1, const cudaTextureObject_t normal_image2, const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, const int2 p)
+{
+    const float max_cost = 2.0f;
+
+    float depth = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
+    float3 forward_point = Get3DPointonWorld_cu(p.x, p.y, depth, ref_camera);
+
+    float2 src_pt;
+    float src_d;
+    ProjectonCamera_cu(forward_point, src_camera, src_pt, src_d);
+
+    float4 plane_hypothesis_ref;
+    plane_hypothesis_ref = TransformNormal(ref_camera, plane_hypothesis);
+    float4 plane_hypothesis_src;
+    plane_hypothesis_src.x = tex2D<float>(normal_image0, (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
+    plane_hypothesis_src.y = tex2D<float>(normal_image1, (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
+    plane_hypothesis_src.z = tex2D<float>(normal_image2, (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
+    float normal_crossview_diff = fabs(plane_hypothesis_ref.x - plane_hypothesis_src.x) + fabs(plane_hypothesis_ref.y - plane_hypothesis_src.y) + fabs(plane_hypothesis_ref.z - plane_hypothesis_src.z);
+
+    return min(max_cost, normal_crossview_diff);
+}
+
+__device__ void ComputeMultiViewDepthCostVector(const cudaTextureObject_t* depth_images,
+                                                const Camera* cameras,
+                                                const int2 p,
+                                                const float4 plane_hypothesis,
+                                                float* cost_vector_depth,
+                                                const PatchMatchParams params) 
+{
+    for (int i = 1; i < params.num_images; ++i) {
+        if (params.geom_consistency) {
+            cost_vector_depth[i - 1] = ComputeDepthConsistencyCost(depth_images[i], cameras[0], cameras[i], plane_hypothesis, p);
+        }
+        else {
+            cost_vector_depth[i - 1] = 3.0f;
+        }
+    }
+}
+
+__device__ void ComputeMultiViewNormCostVector(const cudaTextureObject_t* normal_image0,
+                                                const cudaTextureObject_t* normal_image1,
+                                                const  cudaTextureObject_t* normal_image2,
+                                                const Camera* cameras,
+                                                const int2 p,
+                                                const float4 plane_hypothesis,
+                                                float* cost_vector_norm,
+                                                const PatchMatchParams params)
+{
+    for (int i = 1; i < params.num_images; ++i) {
+        if (params.geom_consistency && params.normal_lambda > 0) {
+            cost_vector_norm[i - 1] = ComputeNormConsistencyCost(normal_image0[i], normal_image1[i], normal_image2[i], cameras[0], cameras[i], plane_hypothesis, p);
+        }
+        else {
+            cost_vector_norm[i - 1] = 2.0f;
+        }
+    }
+}
+
+
+__global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera *cameras, float4 *plane_hypotheses,  float4 *scaled_plane_hypotheses, float *costs ,float *pre_costs,  curandState *rand_states, unsigned int *selected_views, const PatchMatchParams params)
+{
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    int width = cameras[0].width;
+    int height = cameras[0].height;
+
+    if (p.x >= width || p.y >= height) {
+        return;
+    }
+
+    const int center = p.y * width + p.x;
+    curand_init(clock64(), p.y, p.x, &rand_states[center]);
+
+    if (!params.geom_consistency && !params.hierarchy ) {
+        plane_hypotheses[center] = GenerateRandomPlaneHypothesis(cameras[0], p, &rand_states[center], params.depth_min, params.depth_max);
+        costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
+    }
+    else {
+        if(params.upsample) {
+            const float scale = 1.0 * params.scaled_cols / width;
+            const float sigmad = 0.50;
+            const float sigmar = 25.5;
+            const int Imagescale = max(width / params.scaled_cols , height / params.scaled_rows);
+            const int WinWidth =Imagescale * Imagescale + 1;
+            int num_neighbors = WinWidth / 2;
+
+            const float o_y = p.y * scale;
+            const float o_x = p.x * scale;
+            const float refPix = tex2D<float>(texture_objects[0].images[0], p.x + 0.5f, p.y + 0.5f);
+            int r_y = 0;
+            int r_ys = 0;
+            int r_x = 0;
+            int r_xs = 0;
+            float sgauss = 0.0, rgauss = 0.0, totalgauss = 0.0;
+            float c_total_val = 0.0, normalizing_factor = 0.0;
+            float  srcPix = 0, neighborPix = 0;
+            float4 srcNorm;
+            float4 n_total_val;
+            n_total_val.x = 0; n_total_val.y = 0; n_total_val.z = 0; n_total_val.w = 0;
+            for (int j = -num_neighbors; j <= num_neighbors; ++j) {
+                // source
+                r_y = o_y + j;
+                r_y = (r_y > 0 ? (r_y < params.scaled_rows ? r_y : params.scaled_rows - 1) : 0) ;
+                // reference
+                r_ys = p.y + j;
+                for (int i = -num_neighbors; i <= num_neighbors; ++i) {
+                    // source
+                    r_x = o_x + i;
+                    r_x = (r_x > 0 ? (r_x < params.scaled_cols? r_x : params.scaled_cols - 1) : 0);
+                    const int s_center = r_y*params.scaled_cols+r_x;
+                    if (s_center >=  params.scaled_rows * params.scaled_cols) {
+                        printf("Illegal: %d, %d, %f, %f (%d, %d)\n", r_x, r_y, o_x, o_y, params.scaled_cols,  params.scaled_rows);
+                    }
+                    srcPix = scaled_plane_hypotheses[s_center].w;
+                    srcNorm = scaled_plane_hypotheses[s_center];
+                    // refIm
+                    r_xs = p.x + i;
+                    neighborPix = tex2D<float>(texture_objects[0].images[0], r_xs + 0.5f, r_ys + 0.5f);
+
+                    sgauss = SpatialGauss(o_x, o_y, r_x, r_y, sigmad);
+                    rgauss = RangeGauss(fabs(refPix - neighborPix), sigmar);
+                    totalgauss = sgauss * rgauss;
+                    normalizing_factor += totalgauss;
+                    c_total_val += srcPix * totalgauss;
+                    mul4((&srcNorm), totalgauss);
+                    n_total_val.x  = n_total_val.x + srcNorm.x;
+                    n_total_val.y  = n_total_val.y + srcNorm.y;
+                    n_total_val.z  = n_total_val.z + srcNorm.z;
+                }
+            }
+            costs[center] = c_total_val / normalizing_factor;
+            vecdiv4((&n_total_val), normalizing_factor);
+            NormalizeVec3(&n_total_val);
+
+            costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
+            pre_costs[center] = costs[center];
+
+            float4 plane_hypothesis = n_total_val;
+            plane_hypothesis = TransformNormal2RefCam(cameras[0], plane_hypothesis);
+            float depth = plane_hypotheses[center].w;
+            plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depth, plane_hypothesis);
+            plane_hypotheses[center] = plane_hypothesis;
+            costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
+         }
+         else {
+             float4 plane_hypothesis;
+             if (params.hierarchy) {
+                 plane_hypothesis = scaled_plane_hypotheses[center];
+             }
+             else {
+                 plane_hypothesis = plane_hypotheses[center];
+             }
+             plane_hypothesis = TransformNormal2RefCam(cameras[0], plane_hypothesis);
+             float depth = plane_hypothesis.w;
+             plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depth, plane_hypothesis);
+             plane_hypotheses[center] = plane_hypothesis;
+             costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
+         }
+    }
+}
+
+__device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images, const cudaTextureObject_t* depth_images, const cudaTextureObject_t* normal0_images, const cudaTextureObject_t *normal1_images, const cudaTextureObject_t* normal2_images, const Camera *cameras, float4 *plane_hypothesis, float4* plane_hypotheses, float *depth, float *cost, curandState *rand_state, const float *view_weights, const float weight_norm, const int2 p, const PatchMatchParams params)
+{
+    float perturbation = 0.02f;
+    // float lambda_mm = 0.9f;
+    float depth_rand = curand_uniform(rand_state) * (params.depth_max - params.depth_min) + params.depth_min;
+    float4 plane_hypothesis_rand = GenerateRandomNormal(cameras[0], p, rand_state, *depth);
+    float depth_perturbed = *depth;
+    float depth_min_perturbed = (1 - perturbation) * depth_perturbed;
+    float depth_max_perturbed = (1 + perturbation) * depth_perturbed;
+    if (depth_min_perturbed < params.depth_min || depth_min_perturbed > params.depth_max) {
+        depth_min_perturbed = params.depth_min;
+    }
+    if (depth_max_perturbed < params.depth_min || depth_max_perturbed > params.depth_max) {
+        depth_max_perturbed = params.depth_max;
+    }
+    do {
+        depth_perturbed = curand_uniform(rand_state) * (depth_max_perturbed - depth_min_perturbed) + depth_min_perturbed;
+    } while (depth_perturbed < params.depth_min || depth_perturbed > params.depth_max);
+    float4 plane_hypothesis_perturbed = GeneratePerturbedNormal(cameras[0], p, *plane_hypothesis, rand_state, perturbation * M_PI);
+
+    const int num_planes = 5;
+    float depths[num_planes] = {depth_rand, *depth, depth_rand, *depth, depth_perturbed};
+    float4 normals[num_planes] = {*plane_hypothesis, plane_hypothesis_rand, plane_hypothesis_rand, plane_hypothesis_perturbed, *plane_hypothesis};
+
+    for (int i = 0; i < num_planes; ++i) {
+        float cost_vector[32] = {2.0f};
+        float cost_depth_vector[32] = { 3.0f };
+        float cost_norm_vector[32] = { 2.0f };
+        float4 temp_plane_hypothesis = normals[i];
+        temp_plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depths[i], temp_plane_hypothesis);
+        ComputeMultiViewCostVector(images, cameras, p, temp_plane_hypothesis, cost_vector, params);
+        ComputeMultiViewDepthCostVector(depth_images, cameras, p, temp_plane_hypothesis, cost_depth_vector, params);
+
+        float temp_cost = 0.0f;
+        for (int j = 0; j < params.num_images - 1; ++j) {
+            if (view_weights[j] > 0) {
+                if (params.geom_consistency) {    
+                    temp_cost += view_weights[j] * (cost_vector[j] + 0.2 * cost_depth_vector[j] + 0.2 * params.normal_lambda * cost_norm_vector[i]);
+                }
+                else {
+                    temp_cost += view_weights[j] * cost_vector[j];
+                }
+            }
+        }
+        temp_cost /= weight_norm;
+        float depth_before = ComputeDepthfromPlaneHypothesis(cameras[0], temp_plane_hypothesis, p);
+        if (depth_before >= params.depth_min && depth_before <= params.depth_max && temp_cost < *cost) {
+            *depth = depth_before;
+            *plane_hypothesis = temp_plane_hypothesis;
+            *cost = temp_cost;
+        }
+    }
+}
+
+__device__ void CheckerboardPropagation(const cudaTextureObject_t *images, const cudaTextureObject_t *depths, const cudaTextureObject_t* normals0, const cudaTextureObject_t* normals1, const cudaTextureObject_t* normals2, const Camera *cameras, float4 *plane_hypotheses, float4* pre_plane_hypotheses, float *costs, float *pre_costs, curandState *rand_states, unsigned int *selected_views, const int2 p, const PatchMatchParams params, const int iter)
+{
+    int width = cameras[0].width;
+    int height = cameras[0].height;
+    if (p.x >= width || p.y >= height) {
+        return;
+    }
+
+    const int center = p.y * width + p.x;
+    int left_near = center - 1;
+    int left_far = center - 3;
+    int right_near = center + 1;
+    int right_far = center + 3;
+    int up_near = center - width;
+    int up_far = center - 3 * width;
+    int down_near = center + width;
+    int down_far = center + 3 * width;
+
+    //Adaptive Checkerboard Sampling
+    float cost_array[8][32] = {2.0f};
+    float cost_array_depth[8][32] = { 3.0f };
+    float cost_array_norm[8][32] = { 2.0f };
+     //0 -- up_near, 1 -- up_far, 2 -- down_near, 3 -- down_far, 4 -- left_near, 5 -- left_far, 6 -- right_near, 7 -- right_far
+    bool flag[8] = {false};
+    int num_valid_pixels = 0;
+
+    float costMin;
+    int costMinPoint;
+    int far_len = 25;
+
+    //up_far
+    if (p.y > 2) {
+        flag[1] = true;
+        num_valid_pixels++;
+        costMin = costs[up_far];
+        costMinPoint = up_far;
+        for (int i = 1; i < far_len; ++i) {
+            if (p.y > 2 + 2 * i) {
+                int pointTemp = up_far - 2 * i * width;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        up_far = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_far], cost_array[1], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[up_far], cost_array_depth[1], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[up_far], cost_array_norm[1], params);
+    }
+
+    //down_far
+    if (p.y < height - 3) {
+        flag[3] = true;
+        num_valid_pixels++;
+        costMin = costs[down_far];
+        costMinPoint = down_far;
+        for (int i = 1; i < far_len; ++i) {
+            if (p.y < height - 3 - 2 * i) {
+                int pointTemp = down_far + 2 * i * width;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        down_far = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[down_far], cost_array_depth[3], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[down_far], cost_array_norm[3], params);
+    }
+
+    //left_far
+    if (p.x > 2) {
+        flag[5] = true;
+        num_valid_pixels++;
+        costMin = costs[left_far];
+        costMinPoint = left_far;
+        for (int i = 1; i < far_len; ++i) {
+            if (p.x > 2 + 2 * i) {
+                int pointTemp = left_far - 2 * i;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        left_far = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[left_far], cost_array_depth[5], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[left_far], cost_array_norm[5], params);
+    }
+
+    //right_far
+    if (p.x < width - 3) {
+        flag[7] = true;
+        num_valid_pixels++;
+        costMin = costs[right_far];
+        costMinPoint = right_far;
+        for (int i = 1; i < far_len; ++i) {
+            if (p.x < width - 3 - 2 * i) {
+                int pointTemp = right_far + 2 * i;
+                if (costMin < costs[pointTemp]) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        right_far = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[right_far], cost_array_depth[7], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[right_far], cost_array_norm[7], params);
+    }
+
+    int near_len = 10;
+
+    //up_near
+    if (p.y > 0) {
+        flag[0] = true;
+        num_valid_pixels++;
+        costMin = costs[up_near];
+        costMinPoint = up_near;
+        for (int i = 0; i < near_len; ++i) {
+            if (p.y > 1 + i && p.x > i) {
+                int pointTemp = center - (1 + i) * width - i;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+            if (p.y > 1 + i && p.x < width - 1 - i) {
+                int pointTemp = center - (1 + i) * width + i;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        up_near = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_near], cost_array[0], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[up_near], cost_array_depth[0], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[up_near], cost_array_norm[0], params);
+    }
+
+    //down_near
+    if (p.y < height - 1) {
+        flag[2] = true;
+        num_valid_pixels++;
+        costMin = costs[down_near];
+        costMinPoint = down_near;
+        for (int i = 0; i < near_len; ++i) {
+            if (p.y < height - 2 - i && p.x > i) {
+                int pointTemp = center + (1 + i) * width - i;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+            if (p.y < height - 2 - i && p.x < width - 1 - i) {
+                int pointTemp = center + (1 + i) * width + i;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        down_near = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[down_near], cost_array_depth[2], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[down_near], cost_array_norm[2], params);
+    }
+
+    //left_near
+    if (p.x > 0) {
+        flag[4] = true;
+        num_valid_pixels++;
+        costMin = costs[left_near];
+        costMinPoint = left_near;
+        for (int i = 0; i < near_len; ++i) {
+            if (p.x > 1 + i && p.y > i) {
+                int pointTemp = center - (1 + i) - i * width;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+            if (p.x > 1 + i && p.y < height - 1 - i) {
+                int pointTemp = center - (1 + i) + i * width;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        left_near = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[left_near], cost_array_depth[4], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[left_near], cost_array_norm[4], params);
+    }
+
+    //right_near
+    if (p.x < width - 1) {
+        flag[6] = true;
+        num_valid_pixels++;
+        costMin = costs[right_near];
+        costMinPoint = right_near;
+        for (int i = 0; i < near_len; ++i) {
+            if (p.x < width - 2 - i && p.y > i) {
+                int pointTemp = center + (1 + i) - i * width;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+            if (p.x < width - 2 - i && p.y < height - 1 - i) {
+                int pointTemp = center + (1 + i) + i * width;
+                if (costs[pointTemp] < costMin) {
+                    costMin = costs[pointTemp];
+                    costMinPoint = pointTemp;
+                }
+            }
+        }
+        right_near = costMinPoint;
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_near], cost_array[6], params);
+        ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[right_near], cost_array_depth[6], params);
+        ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[right_near], cost_array_norm[6], params);
+    }
+
+    const int positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
+
+     //Multi-hypothesis Joint View Selection
+    float view_weights[32] = {0.0f};
+    float view_selection_priors[32] = {0.0f};
+    int neighbor_positions[4] = {center - width, center + width, center - 1, center + 1};
+    for (int i = 0; i < 4; ++i) {
+        if (flag[2 * i]) {
+            for (int j = 0; j < params.num_images - 1; ++j) {
+                if (isSet(selected_views[neighbor_positions[i]], j) == 1) {
+                    view_selection_priors[j] += 0.9f;
+                } else {
+                    view_selection_priors[j] += 0.1f;
+                }
+            }
+        }
+    }
+
+    float sampling_probs[32] = {0.0f};
+    float cost_threshold = 0.8 * expf((iter) * (iter) / (-90.0f));
+
+    for (int i = 0; i < params.num_images - 1; i++) {
+        float count = 0;
+        int count_false = 0;
+        float tmpw = 0;
+        for (int j = 0; j < 8; j++) {
+            if (cost_array[j][i] < cost_threshold) {
+                tmpw += expf(cost_array[j][i] * cost_array[j][i] / (-0.18f));
+                count++;
+            }
+            if (cost_array[j][i] > 1.2f) {
+                count_false++;
+            }
+        }
+        if (count > 2 && count_false < 3) {
+            sampling_probs[i] = tmpw / count;
+        }
+        else if (count_false < 3) {
+            sampling_probs[i] = expf(cost_threshold * cost_threshold / (-0.32f));
+        }
+        sampling_probs[i] = sampling_probs[i] * view_selection_priors[i];
+    }
+
+    TransformPDFToCDF(sampling_probs, params.num_images - 1);
+    for (int sample = 0; sample < 15; ++sample) {
+        const float rand_prob = curand_uniform(&rand_states[center]) - FLT_EPSILON;
+        for (int image_id = 0; image_id < params.num_images - 1; ++image_id) {
+            const float prob = sampling_probs[image_id];
+            if (prob > rand_prob) {
+                view_weights[image_id] += 1.0f;
+                break;
+            }
+        }
+    }
+
+    unsigned int temp_selected_views = 0;
+    int num_selected_view = 0;
+    float weight_norm = 0;
+    for (int i = 0; i < params.num_images - 1; ++i) {
+        if (view_weights[i] > 0) {
+            setBit(temp_selected_views, i);
+            weight_norm += view_weights[i];
+            num_selected_view++;
+        }
+    }
+
+    float final_costs[8] = {0.0f};
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < params.num_images - 1; ++j) {
+            if (view_weights[j] > 0) {
+                if (params.geom_consistency) {
+                    if (flag[i]) {
+                        final_costs[i] += view_weights[j] * (cost_array[i][j] + 0.2f * cost_array_depth[i][j] + 0.2 * params.normal_lambda * cost_array_norm[i][j]);
+                    }
+                    else {
+                        final_costs[i] += view_weights[j] * (cost_array[i][j] + 0.1f * (3.0f + 2.0f * params.normal_lambda));
+                    }
+                }
+                else {
+                    final_costs[i] += view_weights[j] * cost_array[i][j];
+                }
+            }
+        }
+        final_costs[i] /= weight_norm;
+    }
+
+    const int min_cost_idx = FindMinCostIndex(final_costs, 8);
+
+    float cost_vector_now[32] = {2.0f};
+    float cost_vector_depth_now[32] = { 3.0f };
+    float cost_vector_norm_now[32] = { 2.0f };
+    ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[center], cost_vector_now, params);
+    ComputeMultiViewDepthCostVector(depths, cameras, p, plane_hypotheses[center], cost_vector_depth_now, params);
+    ComputeMultiViewNormCostVector(normals0, normals1, normals2, cameras, p, plane_hypotheses[center], cost_vector_norm_now, params);
+    float cost_now = 0.0f;
+    for (int i = 0; i < params.num_images - 1; ++i) {
+        if (params.geom_consistency) {
+            cost_now += view_weights[i] * (cost_vector_now[i] + 0.2f * cost_vector_depth_now[i] + 0.2 * params.normal_lambda * cost_vector_norm_now[i]);
+        }
+        else {
+            cost_now += view_weights[i] * cost_vector_now[i];
+        }
+    }
+    cost_now /= weight_norm;
+
+    // float cost_avg = 0.0f;
+    // if (params.repair) {
+    //     cost_avg = costs[center];
+    // }
+
+    costs[center] = cost_now;
+
+    float depth_now = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
+    float4 plane_hypotheses_now;
+    if (flag[min_cost_idx]) {
+        float depth_before = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[positions[min_cost_idx]], p);
+        if (depth_before >= params.depth_min && depth_before <= params.depth_max && final_costs[min_cost_idx] < cost_now) {
+           depth_now = depth_before;
+           plane_hypotheses_now = plane_hypotheses[positions[min_cost_idx]];
+           cost_now = final_costs[min_cost_idx];
+           selected_views[center] = temp_selected_views;
+        }
+    }
+
+    PlaneHypothesisRefinement(images, depths, normals0, normals1, normals2,cameras, &plane_hypotheses_now, plane_hypotheses, &depth_now, &cost_now, &rand_states[center], view_weights, weight_norm, p, params);
+    
+    if (params.hierarchy) {
+        if (cost_now < pre_costs[center] - 0.1f) {
+            costs[center] = cost_now;
+            plane_hypotheses[center] = plane_hypotheses_now;
+        }
+    }
+    else if (params.repair && iter == params.repair_iter-1) {
+        if (cost_now < pre_costs[center] - params.repair_t) {
+            costs[center] = cost_now;
+            plane_hypotheses[center] = plane_hypotheses_now;
+        }
+        else {
+            costs[center] = pre_costs[center];
+            plane_hypotheses[center] = pre_plane_hypotheses[center];
+        }
+    }
+    else {
+        costs[center] = cost_now;
+        plane_hypotheses[center] = plane_hypotheses_now;
+    }
+}
+
+__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, cudaTextureObjects* texture_normals0, cudaTextureObjects* texture_normals1, cudaTextureObjects* texture_normals2, Camera *cameras, float4 *plane_hypotheses, float4* pre_plane_hypotheses, float *costs,  float *pre_costs,  curandState *rand_states, unsigned int *selected_views, const PatchMatchParams params, const int iter)
+{
+    int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    if (threadIdx.x % 2 == 0) {
+        p.y = p.y * 2;
+    } else {
+        p.y = p.y * 2 + 1;
+    }
+    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, texture_normals0[0].images, texture_normals1[0].images, texture_normals2[0].images, cameras, plane_hypotheses,pre_plane_hypotheses, costs, pre_costs, rand_states, selected_views, p, params, iter);
+}
+
+__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, cudaTextureObjects* texture_normals0, cudaTextureObjects* texture_normals1, cudaTextureObjects* texture_normals2,  Camera *cameras, float4 *plane_hypotheses, float4* pre_plane_hypotheses, float *costs,  float *pre_costs, curandState *rand_states, unsigned int *selected_views, const PatchMatchParams params, const int iter)
+{
+    int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    if (threadIdx.x % 2 == 0) {
+        p.y = p.y * 2 + 1;
+    } else {
+        p.y = p.y * 2;
+    }
+
+    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, texture_normals0[0].images, texture_normals1[0].images, texture_normals2[0].images, cameras, plane_hypotheses, pre_plane_hypotheses, costs, pre_costs, rand_states, selected_views, p, params, iter);
+}
+
+__global__ void GetDepthandNormal(Camera *cameras, float4 *plane_hypotheses, const PatchMatchParams params)
+{
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    const int width = cameras[0].width;
+    const int height = cameras[0].height;
+
+    if (p.x >= width || p.y >= height) {
+        return;
+    }
+
+    const int center = p.y * width + p.x;
+    plane_hypotheses[center].w = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
+    plane_hypotheses[center] = TransformNormal(cameras[0], plane_hypotheses[center]);
+}
+
+__global__ void RecordPreCost(float* costs, float* pre_costs, Camera* cameras, float4* plane_hypotheses, float4* pre_plane_hypotheses) {
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    int width = cameras[0].width;
+    int height = cameras[0].height;
+
+    if (p.x >= width || p.y >= height) {
+        return;
+    }
+
+    const int center = p.y * width + p.x;
+    pre_costs[center] = costs[center];
+    pre_plane_hypotheses[center] = plane_hypotheses[center];
+}
+
+void CNVR::RunPatchMatch()
+{
+    const int width = cameras[0].width;
+    const int height = cameras[0].height;
+
+    int BLOCK_W = 32;
+    int BLOCK_H = (BLOCK_W / 2);
+
+    dim3 grid_size_randinit;
+    grid_size_randinit.x = (width + 16 - 1) / 16;
+    grid_size_randinit.y= (height + 16 - 1) / 16;
+    grid_size_randinit.z = 1;
+    dim3 block_size_randinit;
+    block_size_randinit.x = 16;
+    block_size_randinit.y = 16;
+    block_size_randinit.z = 1;
+
+    dim3 grid_size_checkerboard;
+    grid_size_checkerboard.x = (width + BLOCK_W - 1) / BLOCK_W;
+    grid_size_checkerboard.y= ( (height / 2) + BLOCK_H - 1) / BLOCK_H;
+    grid_size_checkerboard.z = 1;
+    dim3 block_size_checkerboard;
+    block_size_checkerboard.x = BLOCK_W;
+    block_size_checkerboard.y = BLOCK_H;
+    block_size_checkerboard.z = 1;
+
+    int max_iterations = params.max_iterations;
+
+    RandomInitialization<<<grid_size_randinit, block_size_randinit>>>(texture_objects_cuda, cameras_cuda, plane_hypotheses_cuda, scaled_plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, params);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    for (int i = 0; i < max_iterations; ++i) {
+        BlackPixelUpdate << <grid_size_checkerboard, block_size_checkerboard >> > (texture_objects_cuda, texture_depths_cuda, texture_normals0_cuda, texture_normals1_cuda, texture_normals2_cuda, cameras_cuda, plane_hypotheses_cuda, pre_plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, params, i);
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        RedPixelUpdate << <grid_size_checkerboard, block_size_checkerboard >> > (texture_objects_cuda, texture_depths_cuda, texture_normals0_cuda, texture_normals1_cuda, texture_normals2_cuda, cameras_cuda, plane_hypotheses_cuda, pre_plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, params, i);
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        printf("iteration: %d\n", i);
+    }
+    params.repair = true;
+    RecordPreCost <<<grid_size_randinit, block_size_randinit >>> (costs_cuda, pre_costs_cuda, cameras_cuda, plane_hypotheses_cuda, pre_plane_hypotheses_cuda);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    for (int i = 0; i < params.repair_iter; ++i) {
+        BlackPixelUpdate << <grid_size_checkerboard, block_size_checkerboard >> > (texture_objects_cuda, texture_depths_cuda, texture_normals0_cuda, texture_normals1_cuda, texture_normals2_cuda, cameras_cuda, plane_hypotheses_cuda, pre_plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, params, i);
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        RedPixelUpdate << <grid_size_checkerboard, block_size_checkerboard >> > (texture_objects_cuda, texture_depths_cuda, texture_normals0_cuda, texture_normals1_cuda, texture_normals2_cuda, cameras_cuda, plane_hypotheses_cuda, pre_plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, params, i);
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+        printf("repair: %d\n", i);
+    }
+
+    GetDepthandNormal<<<grid_size_randinit, block_size_randinit>>>(cameras_cuda, plane_hypotheses_cuda, params);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    cudaMemcpy(plane_hypotheses_host, plane_hypotheses_cuda, sizeof(float4) * width * height, cudaMemcpyDeviceToHost);
+    cudaMemcpy(costs_host, costs_cuda, sizeof(float) * width * height, cudaMemcpyDeviceToHost);
+    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+}
+
+__global__ void JBU_cu(JBUParameters *jp, JBUTexObj *jt, float *depth)
+{
+    const int2 p = make_int2 ( blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y );
+    const int rows = jp[0].height;
+    const int cols = jp[0].width;
+    const int center = p.y * cols + p.x;
+
+    if (p.x >= cols) {
+        return;
+    }
+    if (p.y >= rows) {
+        return;
+    }
+
+    const float scale  = 1.0 * jp[0].s_width / jp[0].width;
+    const float sigmad = 0.50;
+    const float sigmar = 25.5;
+    const int WinWidth = jp[0].Imagescale * jp[0].Imagescale + 1;
+    int num_neighbors = WinWidth / 2;
+
+    const float o_y = p.y * scale;
+    const float o_x = p.x * scale;
+    const float refPix = tex2D<float>(jt[0].imgs[0], p.x + 0.5f, p.y + 0.5f);
+    int r_y = 0;
+    int r_ys = 0;
+    int r_x = 0;
+    int r_xs = 0;
+    float sgauss = 0.0, rgauss = 0.0, totalgauss = 0.0;
+    float total_val = 0.0, normalizing_factor = 0.0;
+    float  srcPix = 0, neighborPix = 0;
+
+    for (int j = -num_neighbors; j <= num_neighbors; ++j) {
+        // source
+        r_y = o_y + j;
+        r_y = (r_y > 0 ? (r_y < jp[0].s_height ? r_y :jp[0].s_height - 1) : 0) ;
+        // reference
+        r_ys = p.y + j;
+        r_ys = (r_ys > 0 ? (r_ys < jp[0].height ? r_ys :jp[0].height - 1) : 0) ;
+        for (int i = -num_neighbors; i <= num_neighbors; ++i) {
+            // source
+            r_x = o_x + i;
+            r_x = (r_x > 0 ? (r_x < jp[0].s_width ? r_x : jp[0].s_width - 1) : 0);
+           srcPix = tex2D<float>(jt[0].imgs[1], r_x + 0.5f, r_y + 0.5f);
+            // refIm
+            r_xs = p.x + i;
+            r_xs = (r_xs > 0 ? (r_xs < jp[0].width ? r_xs :jp[0].width - 1) : 0) ;
+            neighborPix = tex2D<float>(jt[0].imgs[0], r_xs + 0.5f, r_ys + 0.5f);
+
+            sgauss = SpatialGauss(o_x, o_y, r_x, r_y, sigmad);
+            rgauss = RangeGauss(fabs(refPix - neighborPix), sigmar);
+            totalgauss = sgauss * rgauss;
+            normalizing_factor += totalgauss;
+            total_val += srcPix * totalgauss;
+        }
+    }
+
+    depth[center] = total_val / normalizing_factor;
+
+}
+
+void JBU::CudaRun()
+{
+    int rows = jp_h.height;
+    int cols = jp_h.width;
+
+    dim3 grid_size_initrand;
+    grid_size_initrand.x= (cols + 16 - 1) / 16;
+    grid_size_initrand.y=(rows + 16 - 1) / 16;
+    grid_size_initrand.z= 1;
+    dim3 block_size_initrand;
+    block_size_initrand.x = 16;
+    block_size_initrand.y = 16;
+    block_size_initrand.z = 1;
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+
+    cudaDeviceSynchronize();
+    JBU_cu<<< grid_size_initrand, block_size_initrand>>>(jp_d, jt_d, depth_d);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(depth_h, depth_d, sizeof(float) * rows * cols, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Total time needed for computation: %f seconds\n", milliseconds / 1000.f);
+}
