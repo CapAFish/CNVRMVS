@@ -19,23 +19,21 @@ The code has been tested on Windows 10 with GTX GeForce 3090.
 * [cmake](https://cmake.org/)
 
 ## Usage
+
 * Compile CNVR
-
-
 ``` 
 Configure and generate project in Cmake GUI
-run build.bat
+Run build.bat
 ```
 
 * Test 
 ``` 
 Use script colmap2mvsnet_acm.py to convert COLMAP SfM result to CNVR input   
 Run ./CNVR $data_folder to get reconstruction results
-Run NCD.py to get visualization results of intermediate results
+Run NCD.py to get intermediate visualization results
 ```
 
 ## Results on high-res ETH3D training dataset [2cm]
-
 
 | Mean   | courtyard | delivery_area | electro | facade | kicker | meadow | office | pipes  | playgroud | relief | relief_2 | terrace | terrains |
 |:------:|:---------:|:-------------:|:-------:|:------:|:------:|:------:|:------:|:------:|:---------:|:------:|:--------:|:-------:|:--------:|
